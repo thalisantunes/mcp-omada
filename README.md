@@ -206,3 +206,21 @@ real hardware, injected via a `client_factory` parameter on
 ## License
 
 Apache-2.0 - see [LICENSE](LICENSE).
+
+## Related projects
+
+No official TP-Link MCP server exists as of 2026-07; TP-Link's official
+offering is the [Omada Open API](https://omada-northbound-docs.tplinkcloud.com/)
+(OAuth, `/openapi/v1`, reduced field set). Community MCP servers we know of:
+
+- [MiguelTVMS/tplink-omada-mcp](https://github.com/MiguelTVMS/tplink-omada-mcp) — TypeScript; includes a generic "invoke arbitrary endpoint" tool.
+- [realtydev/omada-mcp](https://github.com/realtydev/omada-mcp) — fork with full CRUD (60+ read/write tools).
+- [gaspareduard/Omada-mcp](https://github.com/gaspareduard/Omada-mcp) — Open-API-based, capability-gated.
+
+How this project differs: **read-only by default with no generic endpoint
+escape hatch** (write tools will land behind an explicit allowlist, mirroring
+[mcp-mikrotik](https://github.com/thalisantunes/mcp-mikrotik)), and the
+**legacy `/api/v2` path** — which Open-API-only clients cannot reach (the
+Open API token is rejected there; verified against real hardware) — for the
+rich per-radio/per-client data, with every field-shape gotcha documented in
+[docs/api-notes.md](docs/api-notes.md).
