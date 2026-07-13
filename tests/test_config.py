@@ -126,3 +126,19 @@ def test_load_settings_reads_real_environ(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("OMADA_PASS", "b")
     settings = load_settings()
     assert settings.base_url == "https://1.2.3.4:8043"
+
+
+def test_allow_write_defaults_false():
+    settings = load_settings(env={"OMADA_BASE_URL": "https://1.2.3.4:8043", "OMADA_USER": "a", "OMADA_PASS": "b"})
+    assert settings.allow_write is False
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [("true", True), ("1", True), ("yes", True), ("on", True), ("false", False), ("nope", False)],
+)
+def test_allow_write_env_parsing(raw: str, expected: bool):
+    settings = load_settings(
+        env={"OMADA_BASE_URL": "https://1.2.3.4:8043", "OMADA_USER": "a", "OMADA_PASS": "b", "OMADA_ALLOW_WRITE": raw}
+    )
+    assert settings.allow_write is expected
