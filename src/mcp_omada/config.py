@@ -11,6 +11,8 @@ mcp-mikrotik).
   OMADA_VERIFY_TLS        - "true"/"1"/"yes"/"on", default false
   OMADA_TIMEOUT            - HTTP timeout in seconds, default 15
   OMADA_LOG_LEVEL           - default INFO
+  OMADA_ALLOW_WRITE        - "true"/"1"/"yes"/"on", default false (v0.2+:
+                            enables write tools - see guard.py)
 
 See .env.example for the full list with commentary.
 """
@@ -61,6 +63,11 @@ class Settings:
     client_secret: str | None = field(default=None, repr=False)
     verify_tls: bool = False
     timeout: float = DEFAULT_TIMEOUT
+    # Read-only by default (v0.2+) - mirrors mcp-mikrotik's
+    # MIKROTIK_ALLOW_WRITE gate exactly. Checked by guard.py's
+    # _require_allowed before anything is read or written for a guarded
+    # write operation, regardless of the tool call's own `confirm` value.
+    allow_write: bool = False
 
 
 def _bool_env(value: str | None, default: bool) -> bool:
@@ -140,6 +147,8 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         except ValueError as exc:
             raise ConfigError(f"OMADA_TIMEOUT must be a number, got {timeout_raw!r}.") from exc
 
+    allow_write = _bool_env(resolved_env.get("OMADA_ALLOW_WRITE"), default=False)
+
     return Settings(
         base_url=base_url,
         auth_mode=auth_mode,
@@ -151,4 +160,5 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         client_secret=client_secret,
         verify_tls=verify_tls,
         timeout=timeout,
+        allow_write=allow_write,
     )

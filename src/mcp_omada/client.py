@@ -36,6 +36,13 @@ No secret (password, client_secret, CSRF token, session cookie, access
 token) is ever included in a log message or an exception's own text -
 exceptions carry only what the controller told us (an errorCode/msg), never
 the request we sent it.
+
+WRITES (v0.2+): `_patch_v2` is this package's only write primitive so far -
+NOT exposed as an MCP tool directly. The only caller allowed to invoke it is
+guard.py (see that module's docstring), which maps each write operation to
+exactly one fixed path via a central ALLOWLIST. server.py never calls
+`_patch_v2` directly - mirrors mcp-mikrotik's client.py "Write primitives"
+convention exactly.
 """
 
 from __future__ import annotations
@@ -232,6 +239,33 @@ class OmadaClient:
             page += 1
         return rows
 
+    def _patch_v2(self, path: str, json_body: dict[str, Any], *, _retried: bool = False) -> dict[str, Any]:
+        """Write primitive - PATCH against /api/v2/*. Legacy auth only (this
+        endpoint is not verified under the Open API - see
+        guard.set_radio_channel).
+
+        NOT exposed as an MCP tool directly, and never called anywhere in
+        this package except guard.py (see that module's docstring): the
+        only caller allowed to invoke this is a dedicated, named function in
+        guard.py that maps each write operation to exactly one fixed path
+        via ALLOWLIST. There is no generic "PATCH this path with this body"
+        tool anywhere in this package - server.py never calls this method.
+        """
+        self._ensure_legacy_login()
+        omadac_id = self._omadacid()
+        full_path = f"/{omadac_id}/api/v2{path}"
+        headers = {"Csrf-Token": self._csrf_token} if self._csrf_token else {}
+        response = self._send("PATCH", full_path, json=json_body, headers=headers)
+        payload = _parse_envelope(response, full_path)
+        if payload.get("errorCode") != 0:
+            if not _retried and _looks_like_auth_failure(response, payload):
+                logger.info("Legacy session appears expired at %s; re-authenticating once.", full_path)
+                self._legacy_logged_in = False
+                return self._patch_v2(path, json_body, _retried=True)
+            raise ControllerCommandError(full_path, payload.get("errorCode"), payload.get("msg"))
+        result = payload.get("result")
+        return result if isinstance(result, dict) else {}
+
     # --- Open API (/openapi/v1) --------------------------------------------
 
     def _ensure_openapi_token(self) -> None:
@@ -410,6 +444,39 @@ class OmadaClient:
             if not ap_rows:
                 raise DeviceNotFoundError(mac_address, resolved_site)
         return ap_rows
+
+    # --- insight/clients + alerts (v0.2, read-only) -------------------------
+
+    def get_clients(self, site_id: str | None = None) -> list[dict[str, Any]]:
+        """Insight/known clients on a site (GET /sites/{sid}/insight/clients)
+        - the controller's "Insight" view: historical + currently-known
+        clients, not just currently-associated ones. Legacy auth ONLY - no
+        Open API equivalent has been verified against real hardware yet.
+        """
+        if self.settings.auth_mode is not AuthMode.LEGACY:
+            raise FeatureUnavailableError(
+                "get_clients",
+                "requires legacy login (OMADA_USER/OMADA_PASS) - no Open API insight/clients "
+                "endpoint has been verified against real hardware yet.",
+            )
+        resolved_site = self.resolve_site_id(site_id)
+        return self._paginate_v2(f"/sites/{resolved_site}/insight/clients")
+
+    def get_alerts(self, site_id: str | None = None) -> list[dict[str, Any]]:
+        """Site alerts (GET /sites/{sid}/alerts). The pagination ENVELOPE
+        (currentPage/currentSize/totalRows/data) is confirmed against real
+        hardware; the SHAPE of an individual alert row is NOT - see
+        formatting.normalize_alert's docstring and docs/api-notes.md.
+        Legacy auth ONLY - no Open API equivalent has been verified.
+        """
+        if self.settings.auth_mode is not AuthMode.LEGACY:
+            raise FeatureUnavailableError(
+                "get_alerts",
+                "requires legacy login (OMADA_USER/OMADA_PASS) - no Open API alerts endpoint has "
+                "been verified against real hardware yet.",
+            )
+        resolved_site = self.resolve_site_id(site_id)
+        return self._paginate_v2(f"/sites/{resolved_site}/alerts")
 
 
 def get_client(settings: Settings) -> OmadaClient:

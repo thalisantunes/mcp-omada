@@ -1,10 +1,19 @@
 """MCP server entrypoint.
 
-Registers the v0.1 read-only tool set. There is no write tool at all yet -
-see README's "Roadmap" and client.py's module docstring for what a future
-v0.2 guarded-write layer (following mcp-mikrotik's guard.py ALLOWLIST
-pattern) would need to handle first (the channel/freq write gotcha
-documented in formatting.parse_channel, in particular).
+Registers the v0.1 read-only tool set plus, as of v0.2, the FIRST guarded
+write tool (`set_radio_channel`) - see `guard.py`'s module docstring for
+the full write-guard model (central allowlist, read-only gate via
+`OMADA_ALLOW_WRITE`, confirm/preview), which mirrors mcp-mikrotik's
+`guard.py` exactly.
+
+`set_radio_channel` is registered UNCONDITIONALLY here, exactly like
+mcp-mikrotik's `set_identity` tool - the read-only gate lives entirely in
+`guard._require_allowed`, checked on every call regardless of
+`OMADA_ALLOW_WRITE`, not in whether the tool is registered at all. This
+mirrors the sibling project's actual (tested) behavior: a write tool is
+always callable, and always cleanly refuses with `WriteDisabledError` when
+writes are disabled - never silently absent, which would be harder for a
+caller (or an LLM) to diagnose than a clear "read-only" error.
 
 Transport is stdio only, exactly like mcp-mikrotik v0 - this process is
 meant to run on the operator's own machine, launched by an MCP client (e.g.
@@ -22,14 +31,16 @@ import functools
 import logging
 import os
 from collections.abc import Callable
+from dataclasses import asdict
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
+from . import guard
 from .client import OmadaClient, get_client
 from .config import Settings, load_settings
 from .exceptions import OmadaMCPError
-from .formatting import is_connected, normalize_device, normalize_radio
+from .formatting import is_connected, normalize_alert, normalize_client, normalize_device, normalize_radio
 from .validation import validate_mac_address
 
 logger = logging.getLogger("mcp_omada")
@@ -171,6 +182,71 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
             }
             for row in rows
         ]
+
+    @mcp.tool()
+    @_safe
+    def get_clients(site_id: str | None = None) -> list[dict[str, Any]]:
+        """List Insight/known clients on a site: mac, name, download/upload
+        (bytes), duration_seconds, last_seen_ms, guest/wireless flags, vid
+        (VLAN), and block/manager flags. This is the controller's "Insight"
+        view (historical + known clients), not just currently-associated
+        ones.
+
+        Requires legacy login (OMADA_USER/OMADA_PASS) - no Open API
+        equivalent has been verified against real hardware yet.
+        """
+        client = _client()
+        rows = client.get_clients(site_id)
+        return [normalize_client(row) for row in rows]
+
+    @mcp.tool()
+    @_safe
+    def get_alerts(site_id: str | None = None) -> list[dict[str, Any]]:
+        """List active alerts on a site.
+
+        The pagination envelope is confirmed against real hardware; the
+        shape of an individual alert row is NOT (no alert was active during
+        verification) - each entry includes a best-effort module/level/
+        content/time guess AND the untouched `raw` row, so nothing is lost
+        if the guess is wrong. See docs/api-notes.md.
+
+        Requires legacy login (OMADA_USER/OMADA_PASS) - no Open API
+        equivalent has been verified against real hardware yet.
+        """
+        client = _client()
+        rows = client.get_alerts(site_id)
+        return [normalize_alert(row) for row in rows]
+
+    # --- Write tools (v0.2+) --------------------------------------------
+    # Every write tool must call a dedicated function in guard.py - never
+    # OmadaClient._patch_v2 directly. See guard.py's module docstring for
+    # how to add the next one.
+
+    @mcp.tool()
+    @_safe
+    def set_radio_channel(
+        mac: str, band: str, channel: int, confirm: bool = False, site_id: str | None = None
+    ) -> dict[str, Any]:
+        """Set an AP's 2.4GHz ("2g") or 5GHz ("5g") radio channel.
+
+        WRITE tool, guarded: blocked entirely unless the server is running
+        with OMADA_ALLOW_WRITE=true. Call with confirm=False (the default)
+        to get a before/after preview (channel + freq) without changing
+        anything; call again with confirm=True to actually apply it.
+
+        Legacy auth only. `channel` is the operator-facing channel number
+        (e.g. 11 on 2.4GHz, 149 on 5GHz) - this tool always derives the
+        matching frequency itself (channels.py) and resends the complete
+        current radio configuration with only channel/freq changed, so the
+        confirmed real-hardware silent-discard gotcha (int channel, or a
+        missing freq) can't be hit by construction - see docs/api-notes.md.
+        """
+        validated_mac = validate_mac_address(mac)
+        client = _client()
+        preview = guard.set_radio_channel(
+            client, settings, mac_address=validated_mac, band=band, channel=channel, confirm=confirm, site_id=site_id
+        )
+        return asdict(preview)
 
     return mcp
 
