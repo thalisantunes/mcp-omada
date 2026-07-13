@@ -49,12 +49,13 @@ mcp-mikrotik's `devices.yaml`).
    | `OMADA_BASE_URL` | *(required)* | Controller base URL, e.g. `https://192.168.1.2:8043` |
    | `OMADA_OMADAC_ID` | *(auto)* | Controller ID; auto-discovered via `GET /api/info` if unset |
    | `OMADA_SITE_ID` | *(auto)* | Site to operate on; auto-selected if the controller manages exactly one site (**legacy auth only** - see below) |
-   | `OMADA_USER` / `OMADA_PASS` | - | Legacy local-user login (**preferred** - richer field set) |
+   | `OMADA_USER` / `OMADA_PASS` | - | Legacy local-user login (**preferred** - richer field set). A **Viewer** role is enough for all read tools; **`set_radio_channel` (write) requires an Administrator-role user** - the controller's own RBAC returns `-1007 "user does not have permissions"` for a Viewer even when `OMADA_ALLOW_WRITE=true` (verified live: a defense-in-depth layer on top of this server's write guard). |
    | `OMADA_CLIENT_ID` / `OMADA_CLIENT_SECRET` | - | Open API `client_credentials` (reduced field set) |
    | `OMADA_VERIFY_TLS` | `false` | Verify the controller's TLS certificate |
    | `OMADA_TIMEOUT` | `15` | HTTP request timeout, in seconds |
    | `OMADA_LOG_LEVEL` | `INFO` | Log level for the server process (stderr) |
    | `OMADA_ALLOW_WRITE` | `false` | Enable write tools (`set_radio_channel`) - see "Security model" |
+   | `OMADA_AUDIT_LOG` | *(unset - stderr)* | File path for the write audit journal (JSON lines) - see "Security model" |
 
    Set **either** `OMADA_USER`+`OMADA_PASS` **or**
    `OMADA_CLIENT_ID`+`OMADA_CLIENT_SECRET` - not partially, and if both
@@ -104,7 +105,7 @@ environment variable - see the `TODO(http-transport)` note at the top of
 
 | Tool | Description |
 |---|---|
-| `set_radio_channel` | Set an AP's 2.4GHz or 5GHz radio channel. Requires `OMADA_ALLOW_WRITE=true` and `confirm=true`; see "Security model" below. **Requires legacy auth.** |
+| `set_radio_channel` | Set an AP's 2.4GHz or 5GHz radio channel. Requires `OMADA_ALLOW_WRITE=true` and `confirm=true`; `applied=true` only after a post-write re-read confirms it - see "Security model" below. **Requires legacy auth.** |
 
 ### Normalization
 
@@ -156,9 +157,10 @@ docstring and `docs/api-notes.md` for the full login flows.
 
 ## Security model
 
-As of v0.2, this section mirrors mcp-mikrotik's own "Security model"
-almost word for word - same three independent controls, centralized in
-`src/mcp_omada/guard.py`:
+`src/mcp_omada/guard.py` follows the security model mcp-mikrotik's own
+`guard.py` established, studied first - not a claim of an exact mirror
+(see `docs/api-notes.md`'s "Design decisions" for where the two genuinely
+diverge and why). Four independent controls apply to `set_radio_channel`:
 
 1. **Read-only by default.** `OMADA_ALLOW_WRITE` defaults to `false`. With
    writes disabled, `set_radio_channel` returns a clear `WriteDisabledError`
@@ -174,16 +176,42 @@ almost word for word - same three independent controls, centralized in
 3. **Explicit confirm with before/after preview.** `set_radio_channel` takes
    a `confirm: bool` parameter. With `confirm=False` (the default), it reads
    the device's current radio configuration and returns what would change -
-   a `before`/`after` structure (channel + freq) - without applying
-   anything. Only `confirm=True` applies the change. A 5GHz write also
-   returns a `warning` explaining the confirmed channel-persists-as-
-   internal-index behavior (see `docs/api-notes.md`), so a caller can't miss
-   it by only checking `applied`.
+   a `before`/`after` structure - without applying anything. Only
+   `confirm=True` applies the change.
+4. **Empirical re-read verification - mcp-omada's own addition, not
+   something mcp-mikrotik needs.** A confirmed write's `errorCode 0` is
+   never trusted on its own: `set_radio_channel` re-reads the device
+   afterward and compares the resulting `freq` against what was requested.
+   `applied=True` is returned ONLY when they match - a controller that
+   accepts a write but doesn't actually apply it (an uncharacterized
+   rejection - a DFS channel the firmware refuses, say - beyond the two
+   silent-discard causes already ruled out by construction) is reported as
+   `applied=False` with a clear `message`, never a false positive. This
+   exists because Omada's controller CAN answer "success" for a write it
+   didn't apply - RouterOS's own API doesn't, so mcp-mikrotik has no
+   equivalent control.
+
+Every call also carries a `warning`: changing a channel restarts the radio
+(clients on that band briefly disconnect and reassociate), plus, on 5GHz,
+the confirmed channel-persists-as-internal-index caveat (see
+`docs/api-notes.md`) - so a caller reading only `applied`/`after` can't
+miss either.
 
 `set_radio_channel` is registered unconditionally (like mcp-mikrotik's
 `set_identity`) - the tool is always callable; `OMADA_ALLOW_WRITE=false`
 makes every call cleanly refuse rather than making the tool disappear,
 which would be harder to diagnose.
+
+**Audit journal.** Every `set_radio_channel` call - previewed, applied,
+rejected by the re-read check, or errored - is recorded as one structured
+JSON-lines event (`src/mcp_omada/audit.py`, following the model
+mcp-mikrotik's `audit.py`/`correlation.py` established): a per-call
+correlation id, the target MAC, before/after, warning/message, and outcome.
+Written to `OMADA_AUDIT_LOG` if set, otherwise a stderr INFO line. Never
+includes a controller credential, in any outcome - see
+`docs/api-notes.md`'s "Audit journal" section for the full shape and the
+fourth outcome (`"rejected"`) mcp-mikrotik's own three-outcome journal has
+no equivalent of.
 
 On top of the write guard:
 
@@ -236,9 +264,10 @@ real hardware, injected via a `client_factory` parameter on
 ## Roadmap
 
 - **v0.2 - delivered.** `set_radio_channel`, the first guarded write,
-  following mcp-mikrotik's `guard.py` `ALLOWLIST` pattern exactly (a named,
-  reviewable write operation; a read-only gate checked before anything is
-  touched; explicit `confirm`/before-after preview) - plus `get_clients`
+  following mcp-mikrotik's `guard.py` model (a named, reviewable write
+  operation; a read-only gate checked before anything is touched; explicit
+  `confirm`/before-after preview; an audit journal) plus, specific to this
+  package, empirical re-read verification of the write - and `get_clients`
   (Insight/known clients) and `get_alerts` (envelope verified, row shape
   honestly flagged as unverified). See `docs/api-notes.md`.
 - **v0.3 - `get_logs` + more guarded writes.** `get_logs` is NOT in v0.2:
