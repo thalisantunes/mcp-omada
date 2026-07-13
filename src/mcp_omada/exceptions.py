@@ -86,3 +86,43 @@ class FeatureUnavailableError(OmadaMCPError):
         super().__init__(f"{feature!r} is not available in this auth mode: {reason}")
         self.feature = feature
         self.reason = reason
+
+
+class WriteDisabledError(OmadaMCPError):
+    """A write tool was called while the server is running in read-only mode
+    (the v0.2 default - see guard.py's module docstring)."""
+
+    def __init__(self, operation: str):
+        super().__init__(
+            f"Write operation {operation!r} was blocked: server is running read-only "
+            "(set OMADA_ALLOW_WRITE=true to enable writes)."
+        )
+        self.operation = operation
+
+
+class GuardViolationError(OmadaMCPError):
+    """A write operation was requested that is not present in the write
+    allowlist (guard.ALLOWLIST).
+
+    This should be unreachable from normal tool use: every write tool
+    exposed in server.py calls a dedicated, named function in guard.py that
+    references a fixed ALLOWLIST key. It exists as a defensive backstop in
+    case a future write tool is wired up incorrectly - mirrors
+    mcp-mikrotik's exceptions.GuardViolationError exactly.
+    """
+
+    def __init__(self, operation: str):
+        super().__init__(f"Write operation {operation!r} is not in the write allowlist.")
+        self.operation = operation
+
+
+class RadioUnavailableError(OmadaMCPError):
+    """The matched device has no `radioSetting<band>` to configure - either
+    it isn't an AP/EAP device at all, or it's a single-band AP asked for the
+    band it doesn't have (e.g. 5GHz on a 2.4GHz-only model)."""
+
+    def __init__(self, mac_address: str, band: str, device_type: str):
+        super().__init__(f"Device {mac_address!r} (type {device_type!r}) has no {band} radio to configure.")
+        self.mac_address = mac_address
+        self.band = band
+        self.device_type = device_type

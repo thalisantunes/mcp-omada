@@ -46,3 +46,19 @@ def validate_mac_address(mac_address: str) -> str:
 
     hex_digits = hex_digits.upper()
     return "-".join(hex_digits[i : i + 2] for i in range(0, 12, 2))
+
+
+_VALID_BANDS = {"2g", "5g"}
+
+
+def validate_band(band: str) -> str:
+    """Validate `band` for `set_radio_channel`: must be "2g" or "5g"
+    (whitespace/case-insensitive), matching the two radios an Omada AP
+    exposes (radioSetting2g/radioSetting5g). Raises ValidationError
+    otherwise - never guesses at a third band."""
+    if not isinstance(band, str) or not band.strip():
+        raise ValidationError("band must be a non-empty string ('2g' or '5g').")
+    normalized = band.strip().lower()
+    if normalized not in _VALID_BANDS:
+        raise ValidationError(f"band {band!r} is not valid - must be '2g' or '5g'.")
+    return normalized

@@ -181,3 +181,54 @@ def normalize_device(row: dict[str, Any], mode: AuthMode) -> dict[str, Any]:
         "wifi_5g": normalize_radio(row.get("wp5g")),
         "auth_mode": mode.value,
     }
+
+
+# --- insight/clients (v0.2) ------------------------------------------------
+
+
+def normalize_client(row: dict[str, Any]) -> dict[str, Any]:
+    """Normalize one `/insight/clients` row - confirmed shape (see
+    docs/api-notes.md): mac, name, download/upload (bytes, int), duration
+    (seconds, int), lastSeen (epoch milliseconds), guest/wireless (bool),
+    vid (VLAN id, int), block/blockDisable/lockToAp/manager (bool)."""
+    return {
+        "mac": row.get("mac"),
+        "name": row.get("name"),
+        "download": row.get("download"),
+        "upload": row.get("upload"),
+        "duration_seconds": row.get("duration"),
+        "last_seen_ms": row.get("lastSeen"),
+        "guest": row.get("guest"),
+        "wireless": row.get("wireless"),
+        "vid": row.get("vid"),
+        "blocked": row.get("block"),
+        "block_disabled": row.get("blockDisable"),
+        "locked_to_ap": row.get("lockToAp"),
+        "manager": row.get("manager"),
+    }
+
+
+# --- alerts (v0.2) - envelope verified, ROW SHAPE NOT VERIFIED -------------
+
+
+def normalize_alert(row: dict[str, Any]) -> dict[str, Any]:
+    """Best-effort normalization of one `/alerts` row.
+
+    UNVERIFIED ROW SHAPE (see docs/api-notes.md): the alerts endpoint's
+    pagination ENVELOPE (currentPage/currentSize/totalRows/data) was
+    confirmed against real hardware, but `totalRows` was 0 at verification
+    time (a healthy network, no active alerts) - the shape of an actual
+    alert ROW was never observed via the API. The keys read below
+    (module/level/content/time) come from the controller's own alerts UI,
+    not a captured API response - treat them as a plausible guess, not a
+    fact, until corrected against a real alert. `raw` always carries the
+    untouched row so a caller can see whatever the controller actually
+    sends, whether or not it matches this guess.
+    """
+    return {
+        "module": row.get("module"),
+        "level": row.get("level"),
+        "content": row.get("content"),
+        "time": row.get("time"),
+        "raw": row,
+    }
