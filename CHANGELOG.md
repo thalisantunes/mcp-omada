@@ -20,22 +20,49 @@ a real EAP fleet - see `docs/api-notes.md` for the full write-up.
   resending the COMPLETE current `radioSetting2g`/`radioSetting5g` object -
   the confirmed real-hardware silent-discard gotcha (`channel` as int, or a
   missing `freq` -> `errorCode 0`, "Success.", no actual effect) can't be
-  hit by construction. A 5GHz write's `WritePreview.warning` surfaces the
-  confirmed channel-persists-as-internal-index behavior (e.g. requesting
-  channel 149 is followed by a re-read showing `channel: "17"`, with `freq`
-  the only reliable round-trip value).
-- **`src/mcp_omada/guard.py`** - the central write-guard, mirroring
-  mcp-mikrotik's `guard.py` exactly: a named `ALLOWLIST` (one entry so far,
-  `set_radio_channel`) mapping each write operation to exactly one fixed
-  endpoint, a read-only gate (`OMADA_ALLOW_WRITE`, default `false`) checked
-  before anything is read or written regardless of `confirm`, and explicit
-  `confirm`/before-after preview (`WritePreview`). No generic "call this
-  endpoint with this body" tool exists anywhere in this package.
+  hit by construction.
+- **Empirical re-read verification.** `errorCode 0` from the controller is
+  NOT trusted on its own: after a confirmed write, `set_radio_channel`
+  re-reads the device and compares `freq` - the one field confirmed
+  reliable on both bands - against what was requested. `applied=True` is
+  returned ONLY when that comparison matches; a write the controller
+  accepted but didn't actually apply (an uncharacterized cause beyond the
+  two known ones - a DFS channel the firmware silently refuses, say) comes
+  back as `applied=False` with a clear `WritePreview.message`, a new
+  "rejected" outcome distinct from both "preview" and "error" - see
+  `docs/api-notes.md`.
+- **`src/mcp_omada/audit.py` + `src/mcp_omada/correlation.py`** - a
+  structured, JSON-lines audit journal for every guarded write, following
+  the model mcp-mikrotik's `audit.py`/`correlation.py`/`guard.py`
+  `_audited` decorator established (studied first): one event per call
+  (`preview`/`applied`/`rejected`/`error`), a per-call correlation id
+  (`OMADA_AUDIT_LOG`, defaults to a stderr INFO line), before/after,
+  `warning`, `message`, and aggressive key-based secret redaction - never a
+  controller credential, in any outcome. The "rejected" outcome and the
+  `endpoint`/`method` (HTTP) vocabulary are deliberate departures from
+  mcp-mikrotik's own three-outcome, `path`/`action` (RouterOS) model - see
+  `audit.py`'s module docstring for why Omada's controller needs the
+  fourth outcome and RouterOS's doesn't.
+- **`WritePreview.warning`** now covers every `set_radio_channel` write, not
+  only 5GHz: changing a channel restarts the radio, momentarily
+  disconnecting clients associated on that band (reassociation) - alongside
+  the existing 5GHz-specific channel-persists-as-internal-index note (e.g.
+  requesting channel 149 is followed by a re-read showing `channel: "17"`,
+  with `freq` the only reliable round-trip value).
+- **`src/mcp_omada/guard.py`** - the central write-guard, following the
+  security model mcp-mikrotik's `guard.py` established: a named
+  `ALLOWLIST` (one entry so far, `set_radio_channel`) mapping each write
+  operation to exactly one fixed endpoint, a read-only gate
+  (`OMADA_ALLOW_WRITE`, default `false`) checked before anything is read or
+  written regardless of `confirm`, explicit `confirm`/before-after preview
+  (`WritePreview`), re-read verification, and the audit journal above. No
+  generic "call this endpoint with this body" tool exists anywhere in this
+  package.
 - **`OMADA_ALLOW_WRITE`** (`config.Settings.allow_write`, default `false`) -
-  mirrors `MIKROTIK_ALLOW_WRITE` exactly. `set_radio_channel` is registered
-  unconditionally (like mcp-mikrotik's `set_identity`) and always cleanly
-  refuses with `WriteDisabledError` when writes are disabled, rather than
-  being silently absent from the tool list.
+  same shape and default as `MIKROTIK_ALLOW_WRITE`. `set_radio_channel` is
+  registered unconditionally (like mcp-mikrotik's `set_identity`) and
+  always cleanly refuses with `WriteDisabledError` when writes are
+  disabled, rather than being silently absent from the tool list.
 - **`OmadaClient._patch_v2`** - this package's first write primitive (PATCH
   against `/api/v2/*`, legacy auth only), following the exact same
   "NOT exposed as an MCP tool directly, only guard.py may call it"
@@ -55,17 +82,30 @@ a real EAP fleet - see `docs/api-notes.md` for the full write-up.
   `GuardViolationError` (defensive backstop, mirrors mcp-mikrotik's),
   `RadioUnavailableError` (a matched device isn't an AP/EAP, or is a
   single-band AP missing the requested radio entirely).
+- `docs/api-notes.md`: the sibling-band preservation assumption behind
+  `set_radio_channel` (a PATCH body only ever contains ONE of
+  `radioSetting2g`/`radioSetting5g` - never both, relying on the controller
+  to leave the untouched band's configuration alone) is now documented
+  explicitly as **verified by live operation** (a real per-band channel
+  correction), **not by an isolated unit test** - now backed by a fake-based
+  regression test too (`test_set_radio_channel_leaves_sibling_band_untouched`).
 - `tests/fakes.py`'s `FakeOmadaController` now simulates the PATCH write
   path faithfully, including the silent-discard gotcha (an int `channel` or
   missing `freq` is accepted but never actually applied - tracked in
   `silent_discards` so a regression shows up as a failing assertion, not a
-  silently-wrong pass) and the confirmed 5GHz channel-persists-as-internal-
-  index behavior (`149` -> `"17"` on re-read).
-- Full pytest suite (100% coverage, 195 tests) covering the guard's
+  silently-wrong pass), an uncharacterized-rejection mode
+  (`reject_next_patch_uncharacterized`, exercising the re-read verification
+  above), and the confirmed 5GHz channel-persists-as-internal-index
+  behavior (`149` -> `"17"` on re-read).
+- Full pytest suite (100% coverage, 239 tests) covering the guard's
   read-only gate, preview-vs-confirm, before/after correctness on both
-  bands, the 5GHz warning, device/radio resolution errors, session-expiry
-  retry on a write, and the write primitive's silent-discard behavior
-  directly; `ruff`/`mypy` clean.
+  bands (now sourced from the post-write re-read, not merely the intended
+  write), the expanded warning, re-read verification (both the verified and
+  the rejected path), the audit journal across all four outcomes and every
+  error type this tool can raise, correlation-id propagation, device/radio
+  resolution errors, session-expiry retry on a write, sibling-band
+  preservation, and the write primitive's silent-discard behavior directly;
+  `ruff`/`mypy` clean.
 
 ### Deliberately not included in v0.2
 

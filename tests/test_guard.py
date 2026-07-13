@@ -54,6 +54,8 @@ def test_set_radio_channel_preview_does_not_apply(
         confirm=False,
     )
     assert preview.applied is False
+    assert preview.message is None  # never attempted - not the same as "rejected"
+    assert preview.warning is not None  # the disruption caveat is shown even on preview
     assert preview.before["channel"] == "11"
     assert preview.after["channel"] == "6"
     assert preview.after["freq"] == 2437
@@ -79,7 +81,17 @@ def test_set_radio_channel_confirm_true_applies_2g(
     )
     assert preview.applied is True
     assert preview.device == AP_MAC
-    assert preview.warning is None  # 2.4GHz carries no special caveat
+    assert preview.message is None
+    # Every write - both bands - carries the client-disruption caveat.
+    assert preview.warning is not None
+    assert "2.4GHz" in preview.warning
+    assert "reassociate" in preview.warning
+    # But NOT the 5GHz-only internal-index note.
+    assert "internal index" not in preview.warning
+
+    # `after` reflects the RE-READ (empirical), not merely the intended write.
+    assert preview.after["channel"] == "6"
+    assert preview.after["freq"] == 2437
 
     device = next(d for d in fake_controller.devices if d.mac == AP_MAC)
     assert device.radio_setting_2g is not None
@@ -103,13 +115,19 @@ def test_set_radio_channel_confirm_true_applies_5g_and_warns(
         confirm=True,
     )
     assert preview.applied is True
-    assert preview.after["channel"] == "149"
-    assert preview.after["freq"] == 5745
+    assert preview.message is None
     assert preview.warning is not None
+    assert "5GHz" in preview.warning
+    assert "reassociate" in preview.warning
     assert "5745" in preview.warning
+    assert "internal index" in preview.warning
 
-    # Confirmed real-hardware behavior: a subsequent read shows channel
-    # persisted as the internal index ("17"), not "149" - freq is reliable.
+    # Confirmed real-hardware behavior: `after` (re-read, empirical) shows
+    # channel persisted as the internal index ("17"), not "149" - freq
+    # (what was actually verified) is reliable and correct.
+    assert preview.after["channel"] == "17"
+    assert preview.after["freq"] == 5745
+
     device = next(d for d in fake_controller.devices if d.mac == AP_MAC)
     assert device.radio_setting_5g is not None
     assert device.radio_setting_5g["channel"] == "17"
@@ -236,6 +254,111 @@ def test_set_radio_channel_session_expiry_triggers_one_automatic_relogin(
 
     assert preview.applied is True
     assert fake_controller.legacy_login_calls == 2  # re-authenticated exactly once
+
+
+# --- empirical re-read verification: errorCode 0 alone is never trusted ----
+
+
+def test_set_radio_channel_uncharacterized_rejection_returns_applied_false(
+    legacy_client_write_enabled: OmadaClient,
+    settings_legacy_write_enabled: Settings,
+    fake_controller: FakeOmadaController,
+):
+    """The controller can answer errorCode 0 ("Success.") for a reason
+    beyond the two known causes (int channel / missing freq) - e.g. a DFS
+    channel the firmware silently refuses. The fake simulates this with
+    `reject_next_patch_uncharacterized`; guard.set_radio_channel must catch
+    it via its post-write re-read, not just trust the envelope."""
+    fake_controller.reject_next_patch_uncharacterized = True
+
+    preview = guard.set_radio_channel(
+        legacy_client_write_enabled,
+        settings_legacy_write_enabled,
+        mac_address=AP_MAC,
+        band="2g",
+        channel=6,
+        confirm=True,
+    )
+
+    assert preview.applied is False
+    assert preview.message is not None
+    assert "errorCode 0" in preview.message
+    assert "not confirmed" in preview.message.lower() or "not confirmed on re-read" in preview.message.lower()
+    # The re-read's ACTUAL freq (unchanged, still the original 2462) is
+    # what `after` reports - not the intended-but-not-applied 2437.
+    assert preview.after["freq"] == 2462
+    assert "2437" in preview.message  # names the expected freq that did NOT take effect
+
+    # The fake's own device state genuinely never changed - this proves the
+    # rejection is real, not just a reporting quirk.
+    device = next(d for d in fake_controller.devices if d.mac == AP_MAC)
+    assert device.radio_setting_2g["channel"] == "11"
+    assert device.radio_setting_2g["freq"] == 2462
+
+
+def test_set_radio_channel_uncharacterized_rejection_still_makes_the_patch_call(
+    legacy_client_write_enabled: OmadaClient,
+    settings_legacy_write_enabled: Settings,
+    fake_controller: FakeOmadaController,
+):
+    """A rejection is only detectable AFTER a real PATCH attempt - confirm
+    it isn't confused with a confirm=False preview (which never calls PATCH
+    at all)."""
+    fake_controller.reject_next_patch_uncharacterized = True
+
+    guard.set_radio_channel(
+        legacy_client_write_enabled,
+        settings_legacy_write_enabled,
+        mac_address=AP_MAC,
+        band="2g",
+        channel=6,
+        confirm=True,
+    )
+
+    assert len(fake_controller.patch_calls) == 1
+
+
+def test_set_radio_channel_verified_success_has_no_message(
+    legacy_client_write_enabled: OmadaClient,
+    settings_legacy_write_enabled: Settings,
+):
+    preview = guard.set_radio_channel(
+        legacy_client_write_enabled,
+        settings_legacy_write_enabled,
+        mac_address=AP_MAC,
+        band="2g",
+        channel=6,
+        confirm=True,
+    )
+    assert preview.applied is True
+    assert preview.message is None
+
+
+# --- sibling-band preservation (verified by live operation, not a unit ------
+# --- test, until now - see docs/api-notes.md) -------------------------------
+
+
+def test_set_radio_channel_leaves_sibling_band_untouched(
+    legacy_client_write_enabled: OmadaClient,
+    settings_legacy_write_enabled: Settings,
+    fake_controller: FakeOmadaController,
+):
+    """set_radio_channel's PATCH body only ever contains the ONE band being
+    changed (radioSetting2g OR radioSetting5g, never both) - this asserts
+    the sibling band's stored configuration is untouched by a 2g write."""
+    original_5g = dict(next(d for d in fake_controller.devices if d.mac == AP_MAC).radio_setting_5g)
+
+    guard.set_radio_channel(
+        legacy_client_write_enabled,
+        settings_legacy_write_enabled,
+        mac_address=AP_MAC,
+        band="2g",
+        channel=6,
+        confirm=True,
+    )
+
+    device = next(d for d in fake_controller.devices if d.mac == AP_MAC)
+    assert device.radio_setting_5g == original_5g
 
 
 # --- allowlist sanity (mirrors mcp-mikrotik's test_guard.py) --------------

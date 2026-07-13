@@ -3,8 +3,9 @@
 Registers the v0.1 read-only tool set plus, as of v0.2, the FIRST guarded
 write tool (`set_radio_channel`) - see `guard.py`'s module docstring for
 the full write-guard model (central allowlist, read-only gate via
-`OMADA_ALLOW_WRITE`, confirm/preview), which mirrors mcp-mikrotik's
-`guard.py` exactly.
+`OMADA_ALLOW_WRITE`, confirm/preview, empirical re-read verification, and
+an audit journal), which follows the security model mcp-mikrotik's
+`guard.py` established.
 
 `set_radio_channel` is registered UNCONDITIONALLY here, exactly like
 mcp-mikrotik's `set_identity` tool - the read-only gate lives entirely in
@@ -36,7 +37,7 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from . import guard
+from . import correlation, guard
 from .client import OmadaClient, get_client
 from .config import Settings, load_settings
 from .exceptions import OmadaMCPError
@@ -71,24 +72,33 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
         return client
 
     def _safe(fn):
-        """Make sure nothing unexpected leaks a raw traceback or a secret.
+        """Make sure nothing unexpected leaks a raw traceback or a secret,
+        and give every call (read or write) a short correlation id that
+        ties its logs - and, for write tools, its audit journal entry (see
+        guard.py's `_audited`) - back to one specific call end to end.
+        Mirrors mcp-mikrotik's `_safe` wrapper exactly.
 
         Deliberately re-raises rather than returning an error dict - see
         mcp-mikrotik's server.py for the identical rationale (FastMCP's own
         error path turns a clean exception into a proper isError tool
         result carrying just its message; OmadaMCPError subclasses in
-        exceptions.py are already safe to show a caller).
+        exceptions.py are already safe to show a caller). The correlation id
+        is prefixed onto the server-side log line only - never appended to
+        the exception's own message - so no caller-facing error text changes
+        shape.
         """
 
         @functools.wraps(fn)
         def inner(*args: Any, **kwargs: Any) -> Any:
-            try:
-                return fn(*args, **kwargs)
-            except OmadaMCPError:
-                raise
-            except Exception:
-                logger.exception("Unhandled error in tool %s", fn.__name__)
-                raise RuntimeError("Internal error handling this tool call; see server logs.") from None
+            with correlation.bind() as correlation_id:
+                try:
+                    return fn(*args, **kwargs)
+                except OmadaMCPError as exc:
+                    logger.info("[%s] tool %s failed: %s", correlation_id, fn.__name__, exc)
+                    raise
+                except Exception:
+                    logger.exception("[%s] Unhandled error in tool %s", correlation_id, fn.__name__)
+                    raise RuntimeError("Internal error handling this tool call; see server logs.") from None
 
         return inner
 
@@ -233,6 +243,17 @@ def build_server(settings: Settings | None = None, client_factory: ClientFactory
         with OMADA_ALLOW_WRITE=true. Call with confirm=False (the default)
         to get a before/after preview (channel + freq) without changing
         anything; call again with confirm=True to actually apply it.
+
+        `applied=True` is only ever returned once a post-write re-read
+        confirms the change (comparing `freq`, the one reliable round-trip
+        value) - a bare "the controller said Success" is never trusted on
+        its own. If the controller accepted the write but the re-read shows
+        no change, `applied=False` and `message` explains why - see
+        guard.set_radio_channel's docstring and docs/api-notes.md. Every
+        call also carries a `warning`: changing a channel restarts the
+        radio (clients on that band briefly disconnect and reassociate),
+        plus, on 5GHz, the confirmed channel-persists-as-internal-index
+        caveat.
 
         Legacy auth only. `channel` is the operator-facing channel number
         (e.g. 11 on 2.4GHz, 149 on 5GHz) - this tool always derives the

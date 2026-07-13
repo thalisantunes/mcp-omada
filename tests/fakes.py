@@ -342,6 +342,15 @@ class FakeOmadaController:
     # See formatting.normalize_alert's docstring for why the ROW shape below
     # is a best-effort guess, only used when a test opts into a non-empty list.
     alerts: list[dict[str, Any]] = field(default_factory=list)
+    # One-shot: the NEXT PATCH .../eaps/{MAC} is accepted (errorCode 0,
+    # "Success.") EVEN WITH A WELL-FORMED payload (channel as string, freq
+    # filled in) but never actually applied - simulates an uncharacterized
+    # silent discard (e.g. a DFS channel the firmware silently refuses)
+    # beyond the two known causes (int channel / missing freq) guard.py's
+    # request construction already rules out. Exercises
+    # guard.set_radio_channel's post-write re-read verification (v0.2
+    # finding: errorCode 0 alone must never be trusted for applied=True).
+    reject_next_patch_uncharacterized: bool = False
 
     def __post_init__(self) -> None:
         self.info_calls = 0
@@ -502,6 +511,13 @@ class FakeOmadaController:
 
         self.patch_calls.append({"mac": mac, "path": request.url.path})
         body = json.loads(request.content or b"{}")
+
+        if self.reject_next_patch_uncharacterized:
+            # errorCode 0 "Success." - but skip every mutation below, exactly
+            # as if the controller silently refused the write for a reason
+            # this fake (like the real one) never explains. One-shot.
+            self.reject_next_patch_uncharacterized = False
+            return _json_response(200, _envelope({}))
 
         for radio_key, attr_name in (("radioSetting2g", "radio_setting_2g"), ("radioSetting5g", "radio_setting_5g")):
             if radio_key not in body:

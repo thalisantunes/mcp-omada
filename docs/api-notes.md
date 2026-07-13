@@ -217,11 +217,55 @@ every 5GHz write, so a caller reading only `applied`/`after` still can't
 miss it. On 2.4GHz, `channel` and `freq` stay in lockstep with the operator
 channel number (e.g. channel 11 = freq 2462) - no such gotcha there.
 
+**Every channel write restarts the radio.** Regardless of band, applying a
+channel change disconnects clients currently associated on that radio - they
+reassociate once it comes back up. Not something the API response itself
+signals in any way (no field marks this) - it follows from what a channel
+change *is* on any 802.11 radio, confirmed by observing the fleet's clients
+drop and reconnect during the live channel corrections this feature was
+verified against. `set_radio_channel`'s `WritePreview.warning` states this
+on EVERY write (both bands), not only the 5GHz-index caveat above.
+
 **Full-object resend requirement:** the complete `radioSetting<band>`
 object must be resent on every write, not just the changed field(s) - a
 partial/sparse payload does not merge with the existing configuration the
 way a REST `PATCH` implies it should. `set_radio_channel` always reads the
 current object first and only overwrites `channel`/`freq` in a copy of it.
+
+**Assumption - PATCH targets only the band being changed, never both.**
+`set_radio_channel`'s request body always contains exactly ONE of
+`radioSetting2g`/`radioSetting5g` (the band being changed), never both,
+relying on the controller to leave the untouched sibling band's
+configuration exactly as it was. This was **verified by live operation**
+(per-band channel corrections against the real EAP fleet on 2026-07-13 -
+changing 2.4GHz never altered the AP's 5GHz configuration, and vice versa)
+- it was **not** independently confirmed by an isolated unit test until
+this write-up (see `tests/test_guard.py`'s
+`test_set_radio_channel_leaves_sibling_band_untouched`, added afterward as
+a regression lock, not as the original verification).
+
+**Empirical re-read verification - `errorCode 0` is NOT trusted on its
+own.** Both gotchas above are the two KNOWN causes of a silent discard, but
+a controller answering `errorCode 0` is not proof a write actually applied
+for any OTHER, uncharacterized reason (a DFS channel the firmware silently
+refuses, for instance - not independently confirmed, but plausible and not
+ruled out either). So after every confirmed write, `set_radio_channel`
+performs a SECOND `GET /eaps/{MAC}` and compares the resulting `freq` -
+never `channel`, given the 5GHz index gotcha above - against the requested
+value:
+- Match -> `applied=True`, `WritePreview.after` is the re-read's actual
+  radioSetting object (empirical, not merely the intended write).
+- Mismatch -> `applied=False` even though the PATCH itself reported
+  success, with `WritePreview.message` explaining exactly what didn't
+  match (e.g. `"Controller accepted the write (errorCode 0) but the change
+  was NOT confirmed on re-read: freq is still 2462 (expected 2437)."`).
+  This is a distinct outcome from a `confirm=False` preview (which never
+  attempts a write at all) - the audit journal below records it as
+  `"rejected"`, not `"preview"`.
+
+This closes the "trust the envelope" gap the two known gotchas alone don't
+fully cover - `set_radio_channel` never reports success without positive,
+independent confirmation from the device itself.
 
 **Channel/frequency table** (`channels.py`): 2.4GHz channels 1-13
 (`freq = 2412 + 5*(n-1)`, confirmed for channel 11 = 2462MHz); 5GHz's
@@ -235,6 +279,40 @@ rejected with `ValidationError` before the device is ever touched.
 `set_radio_channel` raises `FeatureUnavailableError` in Open API-only mode.
 **AP/EAP devices only** - raises `RadioUnavailableError` for any other
 device type, or for a single-band AP asked for the band it doesn't have.
+
+### Audit journal (v0.2) - `src/mcp_omada/audit.py` + `correlation.py`
+
+Every `set_radio_channel` call - however it ends - is recorded as one
+JSON-lines event via `audit.record()` (see `guard.py`'s `_audited`
+decorator, the only caller). Destination: `OMADA_AUDIT_LOG` (a file path),
+appended to as one JSON line per event; a plain INFO-level stderr line if
+unset. Each event carries a `correlation_id` (a 12-hex-char id, one per MCP
+tool call - see `correlation.py`), `device` (the AP's MAC), `tool`,
+`operation`, `action` (the write's HTTP method, `"PATCH"`), `confirm`, an
+`outcome`, and a `summary` (`before`/`after`/`warning`/`message`).
+
+Four outcomes, one more than mcp-mikrotik's own three
+(`"preview"`/`"applied"`/`"error"`) - the extra one, `"rejected"`, exists
+because Omada's controller can answer `errorCode 0` without actually
+applying a write (see the re-read verification above), something
+RouterOS's own API doesn't do:
+
+| Outcome | When |
+|---|---|
+| `preview` | `confirm=False` - nothing was sent to the device. |
+| `applied` | `confirm=True`, PATCH sent, post-write re-read confirmed the change. |
+| `rejected` | `confirm=True`, PATCH sent, controller said `errorCode 0`, but the post-write re-read did NOT confirm the change. |
+| `error` | Any exception, at any point - even a read-only-gate refusal before the device is ever touched. |
+
+No controller credential (password, client secret, CSRF token, session
+cookie, Open API access token) can ever reach a journal entry -
+`audit._sanitize()` recursively drops any dict key matching a broad
+password/secret/token/credential/passphrase/psk/pre-shared/private/cookie
+pattern, on top of the fact that a `radioSetting` object never legitimately
+carries one in the first place. Writing the journal is best-effort and
+never raises - a bad `OMADA_AUDIT_LOG` path or an unserializable value is
+caught, logged as a warning, and never blocks or fails the write it
+describes.
 
 ### `GET /openapi/v1/{oid}/sites/{sid}/devices?page=1&pageSize=100` (Open API)
 
@@ -367,3 +445,44 @@ above doesn't cover, documented here so they're easy to revisit:
   endpoint path tried returned `errorCode -1600` (see "Endpoints tried and
   NOT found" above) - rather than ship a tool against a guessed, unverified
   path, it stays out until a working endpoint is found (v0.3).
+- **"Mirrors mcp-mikrotik's guard.py" is a starting point, not a claim of
+  identity - corrected after an adversarial review flagged the earlier
+  wording as overstated.** Before this write-up's second pass, `guard.py`
+  described itself as mirroring mcp-mikrotik "exactly," which was true of
+  the read-only gate/allowlist/confirm-preview shape but not of the
+  journal (which didn't exist yet) or of two real, deliberate departures
+  that remain true today: the `"rejected"` outcome (mcp-mikrotik has no
+  equivalent - see "Audit journal" above) and the empirical re-read
+  verification itself (RouterOS's API doesn't need one). The module
+  docstrings and README now say "follows the same security model" and
+  name the differences explicitly, instead of claiming an exact mirror.
+- **Re-read verification checks `freq`, never `channel` - by the same logic
+  as everything else in this document.** The 5GHz internal-index gotcha
+  already establishes that `channel` is not a reliable round-trip value;
+  building the NEW verification step on top of `channel` instead of `freq`
+  would have reintroduced the same class of bug this document exists to
+  prevent. `freq` is the only field checked, on both bands, for
+  consistency (2.4GHz's `channel`/`freq` do stay in lockstep, but nothing
+  is gained by treating the two bands differently here).
+- **The re-read is a second, separate `GET /eaps/{MAC}` call, not a reuse of
+  the PATCH response.** Only `errorCode`/`msg` were confirmed on the
+  `PATCH` response during verification - not whether its `result` ever
+  echoes the new state on a real controller. `set_radio_channel` never
+  assumes either way: it always re-reads with a fresh `GET` rather than
+  trying to parse a verification result out of the `PATCH` response body,
+  which costs this feature a second round-trip but avoids depending on an
+  unverified assumption about that response's shape. `tests/fakes.py`
+  models the `PATCH` response as an empty `result: {}` - a plausible but
+  **not independently verified** choice, made only because the fake has to
+  return something.
+
+## RBAC on writes (verified live 2026-07-13)
+
+`set_radio_channel` (PATCH /eaps/{mac}) requires an **Administrator-role**
+Omada user. A Viewer-role local user (e.g. one created for the read tools)
+is rejected by the controller's own RBAC with `errorCode -1007` ("The
+current user does not have permissions to access this page.") — even when
+`OMADA_ALLOW_WRITE=true`. This is a defense-in-depth layer independent of
+this server's write guard: the audit journal records such a rejection with
+`outcome=error` (verified: correlation id present, no secret leaked). Read
+tools (get_clients, get_alerts, list_devices, etc.) work fine under Viewer.

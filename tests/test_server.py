@@ -314,3 +314,37 @@ async def test_set_radio_channel_invalid_mac_rejected_before_touching_device(set
     with pytest.raises(ToolError) as exc_info:
         await mcp.call_tool("set_radio_channel", {"mac": "not-a-mac", "band": "2g", "channel": 6, "confirm": True})
     assert "not a valid" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_set_radio_channel_uncharacterized_rejection_surfaces_applied_false_with_message(
+    settings_legacy_write_enabled: Settings, transport: httpx.MockTransport, fake_controller: FakeOmadaController
+):
+    """End-to-end: the controller accepts the PATCH (errorCode 0) but never
+    actually applies it - the tool result must NOT claim applied=True just
+    because the request "succeeded"."""
+    fake_controller.reject_next_patch_uncharacterized = True
+    mcp = build_server(settings=settings_legacy_write_enabled, client_factory=_factory(transport))
+
+    _content, result = await mcp.call_tool(
+        "set_radio_channel",
+        {"mac": "50-D4-F7-66-0D-9C", "band": "2g", "channel": 6, "confirm": True, "site_id": fake_controller.site_id},
+    )
+
+    assert result["applied"] is False
+    assert result["message"] is not None
+    assert "not confirmed" in result["message"].lower()
+    device = next(d for d in fake_controller.devices if d.mac == "50-D4-F7-66-0D-9C")
+    assert device.radio_setting_2g["channel"] == "11"  # genuinely untouched
+
+
+@pytest.mark.asyncio
+async def test_set_radio_channel_result_carries_disruption_warning(
+    settings_legacy_write_enabled: Settings, transport: httpx.MockTransport, fake_controller: FakeOmadaController
+):
+    mcp = build_server(settings=settings_legacy_write_enabled, client_factory=_factory(transport))
+    _content, result = await mcp.call_tool(
+        "set_radio_channel",
+        {"mac": "50-D4-F7-66-0D-9C", "band": "2g", "channel": 6, "site_id": fake_controller.site_id},
+    )
+    assert "reassociate" in result["warning"]
