@@ -22,6 +22,8 @@ import httpx
 LEGACY_SESSION_COOKIE = "TPOMADA_SESSIONID"
 LEGACY_SESSION_COOKIE_VALUE = "sess-abc123"
 
+_AP_TYPES = ("ap", "eap")
+
 
 def _json_response(status_code: int, payload: dict[str, Any], *, set_cookie: str | None = None) -> httpx.Response:
     headers = {"content-type": "application/json"}
@@ -40,6 +42,13 @@ def _uptime_string(seconds: int) -> str:
     if hours:
         return f"{hours}h {minutes}m"
     return f"{minutes}m"
+
+
+# Confirmed real-hardware mapping (2026-07-13): requesting 5GHz channel 149
+# is persisted/echoed back on subsequent reads as internal index "17" - see
+# channels.py and docs/api-notes.md. Only this one pairing is confirmed;
+# the fake does not invent a mapping for any other 5GHz channel.
+CONFIRMED_5G_INTERNAL_INDEX = {"149": "17"}
 
 
 @dataclass
@@ -68,6 +77,13 @@ class DeviceSpec:
     sn: str | None = None
     wp2g: dict[str, Any] | None = None
     wp5g: dict[str, Any] | None = None
+    # CONFIG objects (distinct from wp2g/wp5g's RUNTIME summary above) -
+    # only present on the /eaps/{MAC} detail response, confirmed shape:
+    # {"radioEnable":true,"channelWidth":"4","channel":"11","txPower":21,
+    # "txPowerLevel":4,"freq":2462,"wirelessMode":-2}. Mutated in place by
+    # _handle_patch_eap on a valid set_radio_channel write.
+    radio_setting_2g: dict[str, Any] | None = None
+    radio_setting_5g: dict[str, Any] | None = None
 
     def legacy_row(self) -> dict[str, Any]:
         row: dict[str, Any] = {
@@ -177,6 +193,28 @@ def default_devices() -> list[DeviceSpec]:
                 "rxUtil": 8,
                 "interUtil": 3,
             },
+            radio_setting_2g={
+                "radioEnable": True,
+                "channelWidth": "4",
+                "channel": "11",
+                "txPower": 21,
+                "txPowerLevel": 4,
+                "freq": 2462,
+                "wirelessMode": -2,
+            },
+            radio_setting_5g={
+                # Confirmed real-hardware shape: channel already persisted
+                # as the internal index ("17") from a previous configuration
+                # of channel 149 - freq (5745) is the reliable value. See
+                # CONFIRMED_5G_INTERNAL_INDEX above and docs/api-notes.md.
+                "radioEnable": True,
+                "channelWidth": "6",
+                "channel": "17",
+                "txPower": 23,
+                "txPowerLevel": 4,
+                "freq": 5745,
+                "wirelessMode": -2,
+            },
         ),
         DeviceSpec(
             name="AP-Studio-02",
@@ -203,6 +241,17 @@ def default_devices() -> list[DeviceSpec]:
                 "interUtil": 0,
             },
             # No wp5g at all - single-band AP; exercises normalize_radio(None).
+            radio_setting_2g={
+                "radioEnable": True,
+                "channelWidth": "4",
+                "channel": "6",
+                "txPower": 18,
+                "txPowerLevel": 3,
+                "freq": 2437,
+                "wirelessMode": -2,
+            },
+            # No radioSetting5g either - exercises RadioUnavailableError when
+            # set_radio_channel is asked for band="5g" on this device.
         ),
         DeviceSpec(
             name="Switch-Core",
@@ -219,6 +268,43 @@ def default_devices() -> list[DeviceSpec]:
             # No clientNum*/wp2g/wp5g at all - exercises the "field absent
             # from this device type" branch of normalize_device.
         ),
+    ]
+
+
+def default_clients() -> list[dict[str, Any]]:
+    """Confirmed real-hardware shape (GET /sites/{sid}/insight/clients) -
+    see docs/api-notes.md and formatting.normalize_client."""
+    return [
+        {
+            "mac": "A4-83-E7-11-22-33",
+            "name": "thalis-laptop",
+            "download": 1_048_576_000,
+            "upload": 52_428_800,
+            "duration": 3600,
+            "lastSeen": 1_752_364_800_000,
+            "guest": False,
+            "wireless": True,
+            "vid": 10,
+            "block": False,
+            "blockDisable": False,
+            "lockToAp": False,
+            "manager": True,
+        },
+        {
+            "mac": "B8-27-EB-44-55-66",
+            "name": "guest-phone",
+            "download": 10_485_760,
+            "upload": 1_048_576,
+            "duration": 600,
+            "lastSeen": 1_752_364_200_000,
+            "guest": True,
+            "wireless": True,
+            "vid": 20,
+            "block": False,
+            "blockDisable": False,
+            "lockToAp": False,
+            "manager": False,
+        },
     ]
 
 
@@ -250,6 +336,12 @@ class FakeOmadaController:
     # single-retry re-authentication path.
     expire_next_legacy_call: bool = False
     expire_next_openapi_call: bool = False
+    clients: list[dict[str, Any]] = field(default_factory=default_clients)
+    # Empty by default - matches the verified real-hardware state (a healthy
+    # network, totalRows=0) at the moment /alerts' envelope was confirmed.
+    # See formatting.normalize_alert's docstring for why the ROW shape below
+    # is a best-effort guess, only used when a test opts into a non-empty list.
+    alerts: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.info_calls = 0
@@ -257,6 +349,12 @@ class FakeOmadaController:
         self.openapi_token_calls = 0
         self.legacy_calls: list[str] = []
         self.openapi_calls: list[str] = []
+        self.patch_calls: list[dict[str, Any]] = []
+        # Records of a write the fake accepted (errorCode 0) but silently
+        # discarded, per the confirmed real-hardware gotcha - see
+        # _handle_patch_eap. Used to assert this package's own write code
+        # NEVER triggers a discard (the regression this fake locks in).
+        self.silent_discards: list[dict[str, Any]] = []
 
     # --- helpers ---------------------------------------------------------
 
@@ -360,18 +458,74 @@ class FakeOmadaController:
                 200, _envelope(self._paginated(self._legacy_grid_rows(), params, "currentPage", "currentPageSize"))
             )
 
-        if suffix.startswith(f"/sites/{self.site_id}/eaps/"):
+        if suffix.startswith(f"/sites/{self.site_id}/eaps/") and request.method == "GET":
             mac = suffix.rsplit("/", 1)[-1]
-            for device in self.devices:
-                if device.mac == mac and device.type in ("ap", "eap"):
-                    detail = device.legacy_row()
-                    detail["ssidOverrides"] = []
-                    detail["lanPortSettings"] = []
-                    detail["ledSetting"] = {"enable": True}
-                    return _json_response(200, _envelope(detail))
-            return _json_response(200, _envelope(None, error_code=-404, msg="Device not found."))
+            device = self._find_ap(mac)
+            if device is None:
+                return _json_response(200, _envelope(None, error_code=-404, msg="Device not found."))
+            detail = device.legacy_row()
+            detail["ssidOverrides"] = []
+            detail["lanPortSettings"] = []
+            detail["ledSetting"] = {"enable": True}
+            if device.radio_setting_2g is not None:
+                detail["radioSetting2g"] = device.radio_setting_2g
+            if device.radio_setting_5g is not None:
+                detail["radioSetting5g"] = device.radio_setting_5g
+            return _json_response(200, _envelope(detail))
+
+        if suffix.startswith(f"/sites/{self.site_id}/eaps/") and request.method == "PATCH":
+            mac = suffix.rsplit("/", 1)[-1]
+            return self._handle_patch_eap(mac, request)
+
+        if suffix == f"/sites/{self.site_id}/insight/clients":
+            return _json_response(
+                200, _envelope(self._paginated(list(self.clients), params, "currentPage", "currentPageSize"))
+            )
+
+        if suffix == f"/sites/{self.site_id}/alerts":
+            return _json_response(
+                200, _envelope(self._paginated(list(self.alerts), params, "currentPage", "currentPageSize"))
+            )
 
         return _json_response(404, _envelope(None, error_code=-404, msg=f"Not found: {path}"))
+
+    def _find_ap(self, mac: str) -> DeviceSpec | None:
+        for device in self.devices:
+            if device.mac == mac and device.type in _AP_TYPES:
+                return device
+        return None
+
+    def _handle_patch_eap(self, mac: str, request: httpx.Request) -> httpx.Response:
+        device = self._find_ap(mac)
+        if device is None:
+            return _json_response(200, _envelope(None, error_code=-404, msg="Device not found."))
+
+        self.patch_calls.append({"mac": mac, "path": request.url.path})
+        body = json.loads(request.content or b"{}")
+
+        for radio_key, attr_name in (("radioSetting2g", "radio_setting_2g"), ("radioSetting5g", "radio_setting_5g")):
+            if radio_key not in body:
+                continue
+            new_setting = body[radio_key]
+            channel = new_setting.get("channel")
+            freq = new_setting.get("freq")
+            # Confirmed real-hardware gotcha (docs/api-notes.md): accepted
+            # (errorCode 0, "Success.") but SILENTLY DISCARDED - the stored
+            # radioSetting is never actually updated - unless `channel` is a
+            # string AND `freq` is truthy (filled in with the MHz value).
+            if not isinstance(channel, str) or not freq:
+                self.silent_discards.append({"mac": mac, "radio_key": radio_key, "body": dict(new_setting)})
+                continue
+            stored = dict(new_setting)
+            if radio_key == "radioSetting5g" and channel in CONFIRMED_5G_INTERNAL_INDEX:
+                # Confirmed real-hardware gotcha: 5GHz channel persists back
+                # as an internal index, not the requested channel number.
+                stored["channel"] = CONFIRMED_5G_INTERNAL_INDEX[channel]
+            setattr(device, attr_name, stored)
+
+        # Real controller behavior: PATCH returns Success with an empty
+        # result, not an echo of the new state - callers re-GET to verify.
+        return _json_response(200, _envelope({}))
 
     def _handle_openapi(self, request: httpx.Request, path: str, params: httpx.QueryParams) -> httpx.Response:
         auth = request.headers.get("authorization", "")

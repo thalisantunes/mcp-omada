@@ -460,3 +460,104 @@ def test_get_client_returns_wired_omada_client(settings_legacy: Settings):
     client = get_client(settings_legacy)
     assert isinstance(client, OmadaClient)
     assert client.settings is settings_legacy
+
+
+# --- _patch_v2: the write primitive, and the confirmed silent-discard gotcha ---
+# (guard.py's set_radio_channel is the only real caller - these tests exercise
+# the write primitive and the fake's simulation of real-hardware behavior
+# directly, the same way test_guard.py exercises guard.set_radio_channel's
+# own logic on top of it.)
+
+
+def test_patch_v2_int_channel_is_silently_discarded_by_controller(
+    legacy_client: OmadaClient, fake_controller: FakeOmadaController
+):
+    # Confirmed real-hardware gotcha: `channel` as an int (not a string) is
+    # accepted (errorCode 0, "Success.") but the change never actually
+    # applies - this locks the regression: if guard.set_radio_channel ever
+    # stops sending channel as str(channel), this test's assertion on the
+    # device's UNCHANGED state (not just the response) will catch it.
+    result = legacy_client._patch_v2(
+        f"/sites/{fake_controller.site_id}/eaps/50-D4-F7-66-0D-9C",
+        {"radioSetting2g": {"channel": 6, "freq": 2437, "channelWidth": "4"}},
+    )
+    assert result == {}
+    device = next(d for d in fake_controller.devices if d.mac == "50-D4-F7-66-0D-9C")
+    assert device.radio_setting_2g is not None
+    assert device.radio_setting_2g["channel"] == "11"  # unchanged
+    assert len(fake_controller.silent_discards) == 1
+    assert fake_controller.silent_discards[0]["radio_key"] == "radioSetting2g"
+
+
+def test_patch_v2_missing_freq_is_silently_discarded_by_controller(
+    legacy_client: OmadaClient, fake_controller: FakeOmadaController
+):
+    # Confirmed real-hardware gotcha: `freq` left out (or 0) is also
+    # silently discarded, even with `channel` correctly sent as a string.
+    result = legacy_client._patch_v2(
+        f"/sites/{fake_controller.site_id}/eaps/50-D4-F7-66-0D-9C",
+        {"radioSetting2g": {"channel": "6", "channelWidth": "4"}},
+    )
+    assert result == {}
+    device = next(d for d in fake_controller.devices if d.mac == "50-D4-F7-66-0D-9C")
+    assert device.radio_setting_2g["channel"] == "11"  # unchanged
+    assert len(fake_controller.silent_discards) == 1
+
+
+def test_patch_v2_correct_shape_applies(legacy_client: OmadaClient, fake_controller: FakeOmadaController):
+    legacy_client._patch_v2(
+        f"/sites/{fake_controller.site_id}/eaps/50-D4-F7-66-0D-9C",
+        {"radioSetting2g": {"channel": "6", "freq": 2437, "channelWidth": "4"}},
+    )
+    device = next(d for d in fake_controller.devices if d.mac == "50-D4-F7-66-0D-9C")
+    assert device.radio_setting_2g["channel"] == "6"
+    assert device.radio_setting_2g["freq"] == 2437
+    assert fake_controller.silent_discards == []
+
+
+def test_patch_v2_unknown_device_returns_error_envelope(
+    legacy_client: OmadaClient, fake_controller: FakeOmadaController
+):
+    with pytest.raises(ControllerCommandError):
+        legacy_client._patch_v2(f"/sites/{fake_controller.site_id}/eaps/AA-BB-CC-DD-EE-FF", {"radioSetting2g": {}})
+
+
+def test_patch_v2_session_expiry_triggers_one_automatic_relogin(
+    legacy_client: OmadaClient, fake_controller: FakeOmadaController
+):
+    legacy_client.list_sites()  # establish session
+    assert fake_controller.legacy_login_calls == 1
+
+    fake_controller.expire_next_legacy_call = True
+    legacy_client._patch_v2(
+        f"/sites/{fake_controller.site_id}/eaps/50-D4-F7-66-0D-9C",
+        {"radioSetting2g": {"channel": "6", "freq": 2437, "channelWidth": "4"}},
+    )
+    assert fake_controller.legacy_login_calls == 2
+
+
+# --- get_clients / get_alerts (v0.2, read-only) ----------------------------
+
+
+def test_get_clients_legacy_happy_path(legacy_client: OmadaClient, fake_controller: FakeOmadaController):
+    rows = legacy_client.get_clients(fake_controller.site_id)
+    assert len(rows) == 2
+    assert rows[0]["mac"] == "A4-83-E7-11-22-33"
+
+
+def test_get_clients_requires_legacy_auth(openapi_client: OmadaClient):
+    with pytest.raises(FeatureUnavailableError):
+        openapi_client.get_clients()
+
+
+def test_get_alerts_legacy_happy_path_empty_by_default(
+    legacy_client: OmadaClient, fake_controller: FakeOmadaController
+):
+    # Confirmed real-hardware state at verification time: totalRows=0.
+    rows = legacy_client.get_alerts(fake_controller.site_id)
+    assert rows == []
+
+
+def test_get_alerts_requires_legacy_auth(openapi_client: OmadaClient):
+    with pytest.raises(FeatureUnavailableError):
+        openapi_client.get_alerts()

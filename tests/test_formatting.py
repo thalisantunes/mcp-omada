@@ -5,6 +5,8 @@ import pytest
 from mcp_omada.config import AuthMode
 from mcp_omada.formatting import (
     is_connected,
+    normalize_alert,
+    normalize_client,
     normalize_device,
     normalize_radio,
     parse_channel,
@@ -208,3 +210,69 @@ def test_normalize_device_missing_fields_are_none():
     assert normalized["connected"] is None
     assert normalized["uptime_seconds"] is None
     assert normalized["wifi_2g"] is None
+
+
+# --- normalize_client (v0.2) -----------------------------------------------
+
+
+def test_normalize_client_confirmed_shape():
+    row = {
+        "mac": "A4-83-E7-11-22-33",
+        "name": "thalis-laptop",
+        "download": 1_048_576_000,
+        "upload": 52_428_800,
+        "duration": 3600,
+        "lastSeen": 1_752_364_800_000,
+        "guest": False,
+        "wireless": True,
+        "vid": 10,
+        "block": False,
+        "blockDisable": False,
+        "lockToAp": False,
+        "manager": True,
+    }
+    assert normalize_client(row) == {
+        "mac": "A4-83-E7-11-22-33",
+        "name": "thalis-laptop",
+        "download": 1_048_576_000,
+        "upload": 52_428_800,
+        "duration_seconds": 3600,
+        "last_seen_ms": 1_752_364_800_000,
+        "guest": False,
+        "wireless": True,
+        "vid": 10,
+        "blocked": False,
+        "block_disabled": False,
+        "locked_to_ap": False,
+        "manager": True,
+    }
+
+
+def test_normalize_client_missing_fields_are_none():
+    normalized = normalize_client({})
+    assert normalized["mac"] is None
+    assert normalized["download"] is None
+    assert normalized["guest"] is None
+
+
+# --- normalize_alert (v0.2 - unverified row shape) -------------------------
+
+
+def test_normalize_alert_best_effort_fields_and_raw():
+    row = {"module": "device", "level": "warning", "content": "AP offline", "time": 1_752_364_800_000, "extra": "x"}
+    normalized = normalize_alert(row)
+    assert normalized["module"] == "device"
+    assert normalized["level"] == "warning"
+    assert normalized["content"] == "AP offline"
+    assert normalized["time"] == 1_752_364_800_000
+    assert normalized["raw"] == row
+
+
+def test_normalize_alert_missing_fields_are_none_but_raw_preserved():
+    row = {"somethingUnexpected": True}
+    normalized = normalize_alert(row)
+    assert normalized["module"] is None
+    assert normalized["level"] is None
+    assert normalized["content"] is None
+    assert normalized["time"] is None
+    assert normalized["raw"] == row

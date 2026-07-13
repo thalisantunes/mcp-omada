@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from mcp_omada.exceptions import ValidationError
-from mcp_omada.validation import validate_mac_address
+from mcp_omada.validation import validate_band, validate_mac_address
 
 
 @pytest.mark.parametrize(
@@ -40,3 +40,22 @@ def test_validate_mac_address_rejects_invalid(raw: str):
 def test_validate_mac_address_rejects_non_string():
     with pytest.raises(ValidationError):
         validate_mac_address(None)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [("2g", "2g"), ("5g", "5g"), ("2G", "2g"), ("5G", "5g"), ("  5g  ", "5g")],
+)
+def test_validate_band_normalizes(raw: str, expected: str):
+    assert validate_band(raw) == expected
+
+
+@pytest.mark.parametrize("raw", ["", "   ", "6g", "2.4g", "24", "5", "band"])
+def test_validate_band_rejects_invalid(raw: str):
+    with pytest.raises(ValidationError):
+        validate_band(raw)
+
+
+def test_validate_band_rejects_non_string():
+    with pytest.raises(ValidationError):
+        validate_band(None)  # type: ignore[arg-type]

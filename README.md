@@ -2,8 +2,8 @@
 
 A [Model Context Protocol](https://modelcontextprotocol.io) server for
 [TP-Link Omada](https://www.tp-link.com/en/omada-sdn/) SDN controllers -
-read controller/site/device/WiFi state from an MCP client such as Claude
-Code.
+read controller/site/device/WiFi state and, for one guarded write, change
+it, from an MCP client such as Claude Code.
 
 This is a from-scratch implementation, sibling to
 [mcp-mikrotik](https://github.com/thalisantunes/mcp-mikrotik): same
@@ -15,11 +15,12 @@ authentication mechanisms - see "Verified against real hardware" below.
 
 ## Status
 
-**v0.1: read-only.** Five read tools covering controller identity, sites,
-devices, device detail, and per-AP WiFi summary. There is no write tool at
-all yet - see "Roadmap" below for what v0.2 needs to get right before adding
-one, and `docs/api-notes.md` for a verified write endpoint's gotchas,
-documented in advance so v0.2 doesn't have to rediscover them.
+**v0.2: read tools + the first guarded write.** Seven read tools (controller
+identity, sites, devices, device detail, per-AP WiFi summary, Insight
+clients, alerts) plus one write tool, `set_radio_channel`, gated by the same
+read-only-by-default + central allowlist + confirm/preview model
+[mcp-mikrotik](https://github.com/thalisantunes/mcp-mikrotik) established -
+see `src/mcp_omada/guard.py` and "Security model" below.
 
 ## Installation
 
@@ -53,6 +54,7 @@ mcp-mikrotik's `devices.yaml`).
    | `OMADA_VERIFY_TLS` | `false` | Verify the controller's TLS certificate |
    | `OMADA_TIMEOUT` | `15` | HTTP request timeout, in seconds |
    | `OMADA_LOG_LEVEL` | `INFO` | Log level for the server process (stderr) |
+   | `OMADA_ALLOW_WRITE` | `false` | Enable write tools (`set_radio_channel`) - see "Security model" |
 
    Set **either** `OMADA_USER`+`OMADA_PASS` **or**
    `OMADA_CLIENT_ID`+`OMADA_CLIENT_SECRET` - not partially, and if both
@@ -86,7 +88,7 @@ environment variable - see the `TODO(http-transport)` note at the top of
 
 ## Tools
 
-All read-only in v0.1.
+### Read-only
 
 | Tool | Description |
 |---|---|
@@ -95,6 +97,14 @@ All read-only in v0.1.
 | `list_devices` | Devices on a site, normalized to one consistent shape regardless of auth mode - see below. |
 | `get_device_detail` | Richest available detail for one device, by MAC (any common format accepted). |
 | `get_wifi_summary` | Per-AP WiFi summary: parsed 2.4GHz/5GHz channel, client counts per band, radio utilization. **Requires legacy auth.** |
+| `get_clients` | Insight/known clients on a site: mac, name, download/upload bytes, duration, last_seen, guest/wireless flags, VLAN, block/manager flags. **Requires legacy auth.** |
+| `get_alerts` | Active alerts on a site. Pagination envelope confirmed against real hardware; individual alert row shape is a documented best-effort guess (`raw` always included) - see `docs/api-notes.md`. **Requires legacy auth.** |
+
+### Write (guarded)
+
+| Tool | Description |
+|---|---|
+| `set_radio_channel` | Set an AP's 2.4GHz or 5GHz radio channel. Requires `OMADA_ALLOW_WRITE=true` and `confirm=true`; see "Security model" below. **Requires legacy auth.** |
 
 ### Normalization
 
@@ -119,10 +129,12 @@ The normalization itself encodes three confirmed real-hardware gotchas
 ## Verified against real hardware (OC200 v5.13.30.20)
 
 Everything below was confirmed against a real OC200 running firmware
-v5.13.30.20 on 2026-07-12 - not assumed from public docs (which are thin,
-and in places silent about exactly these details). Full write-up,
-including the verified-but-not-yet-exposed write endpoint and its
-gotchas, in [`docs/api-notes.md`](docs/api-notes.md).
+v5.13.30.20, across two verification passes (2026-07-12 reads, 2026-07-13
+`set_radio_channel`/`get_clients`/`get_alerts` - the latter while correcting
+the channels of a real EAP fleet) - not assumed from public docs (which are
+thin, and in places silent about exactly these details). Full write-up,
+including the write endpoint's silent-discard gotcha, in
+[`docs/api-notes.md`](docs/api-notes.md).
 
 | Capability | Legacy (`/api/v2`) | Open API (`/openapi/v1`) |
 |---|---|---|
@@ -132,6 +144,10 @@ gotchas, in [`docs/api-notes.md`](docs/api-notes.md).
 | Per-device detail | Yes for AP/EAP devices (`/eaps/{MAC}`) | No separate endpoint verified - returns the list row |
 | Per-radio WiFi detail (`wp2g`/`wp5g`) | Yes | **Absent entirely** |
 | `connected` semantics | `statusCategory==1`, fallback `status==14` | `status==1` (different meaning, same field name) |
+| Insight/known clients | Yes | **Not verified** |
+| Alerts | Yes (envelope only - row shape unverified) | **Not verified** |
+| Set AP radio channel (write) | Yes (`PATCH /eaps/{MAC}`) | **Not verified** |
+| Device/system logs | **Not found** - every path tried returned `errorCode -1600`; deferred to v0.3 | Not attempted |
 
 The two auth mechanisms (legacy session + CSRF token vs. Open API access
 token) are **not interchangeable** - a session from one is rejected (empty
@@ -140,10 +156,37 @@ docstring and `docs/api-notes.md` for the full login flows.
 
 ## Security model
 
-- **Read-only by construction, not by a runtime flag.** Unlike
-  mcp-mikrotik's `MIKROTIK_ALLOW_WRITE` gate, v0.1 has **no write tool
-  registered at all** - there is no code path to a write, guarded or
-  otherwise, yet.
+As of v0.2, this section mirrors mcp-mikrotik's own "Security model"
+almost word for word - same three independent controls, centralized in
+`src/mcp_omada/guard.py`:
+
+1. **Read-only by default.** `OMADA_ALLOW_WRITE` defaults to `false`. With
+   writes disabled, `set_radio_channel` returns a clear `WriteDisabledError`
+   and never touches the device - the gate is checked before any read or
+   write call is made, regardless of `confirm`.
+2. **Central allowlist, no generic command tool.** There is no tool that
+   accepts an arbitrary API path or request body. The one write operation
+   this package exposes is a dedicated, named function
+   (`guard.set_radio_channel`) mapped to exactly one fixed endpoint in
+   `guard.ALLOWLIST`. There is no code path by which a caller can reach an
+   API path outside that table - `OmadaClient._patch_v2` (the underlying
+   write primitive) is never called anywhere except that one function.
+3. **Explicit confirm with before/after preview.** `set_radio_channel` takes
+   a `confirm: bool` parameter. With `confirm=False` (the default), it reads
+   the device's current radio configuration and returns what would change -
+   a `before`/`after` structure (channel + freq) - without applying
+   anything. Only `confirm=True` applies the change. A 5GHz write also
+   returns a `warning` explaining the confirmed channel-persists-as-
+   internal-index behavior (see `docs/api-notes.md`), so a caller can't miss
+   it by only checking `applied`.
+
+`set_radio_channel` is registered unconditionally (like mcp-mikrotik's
+`set_identity`) - the tool is always callable; `OMADA_ALLOW_WRITE=false`
+makes every call cleanly refuse rather than making the tool disappear,
+which would be harder to diagnose.
+
+On top of the write guard:
+
 - **Structured HTTP, not shell commands.** All controller communication
   goes through [`httpx`](https://www.python-httpx.org/) with structured URL
   path segments, query parameters, and JSON bodies. Nothing in this
@@ -151,9 +194,12 @@ docstring and `docs/api-notes.md` for the full login flows.
   input, so injection through a MAC address or site ID is ruled out by
   construction rather than by input filtering.
 - **Input validation on top, for its own sake.** `get_device_detail`/
-  `get_wifi_summary`'s `mac` argument is still validated and normalized
-  before use (`src/mcp_omada/validation.py`), purely to reject garbage
-  input early with a clear error - not as an injection defense (see
+  `get_wifi_summary`/`set_radio_channel`'s `mac` argument is still validated
+  and normalized before use (`src/mcp_omada/validation.py`), and
+  `set_radio_channel`'s `band`/`channel` are validated against a fixed
+  channel/frequency table (`src/mcp_omada/channels.py`) before any device is
+  touched - purely to reject garbage input early with a clear error, not as
+  an injection defense (see
   previous point).
 - **No secrets in output or logs.** Password, client secret, CSRF token,
   session cookie, and Open API access token are never included in a log
@@ -189,15 +235,21 @@ real hardware, injected via a `client_factory` parameter on
 
 ## Roadmap
 
-- **v0.2 - guarded writes.** Following mcp-mikrotik's `guard.py`
-  `ALLOWLIST` pattern exactly (a named, reviewable write operation per
-  entry; a read-only gate checked before anything is touched; explicit
-  `confirm`/before-after preview): `set_radio_channel` (must apply the
-  `channel`-as-string + `freq`-filled-in write shape documented in
-  `docs/api-notes.md`, or the controller silently discards the change),
-  AP reboot, LED control.
-- **v0.3 - clients/alerts/logs.** Read tools for connected client lists,
-  controller alerts, and device/system logs.
+- **v0.2 - delivered.** `set_radio_channel`, the first guarded write,
+  following mcp-mikrotik's `guard.py` `ALLOWLIST` pattern exactly (a named,
+  reviewable write operation; a read-only gate checked before anything is
+  touched; explicit `confirm`/before-after preview) - plus `get_clients`
+  (Insight/known clients) and `get_alerts` (envelope verified, row shape
+  honestly flagged as unverified). See `docs/api-notes.md`.
+- **v0.3 - `get_logs` + more guarded writes.** `get_logs` is NOT in v0.2:
+  every device/system log endpoint path tried (`log`, `logs`,
+  `logs/queryLog`, `setting/logs/logs`, `insight/logs`) returned
+  `errorCode -1600` against real hardware - deferred until a working
+  endpoint is found (see `docs/api-notes.md`). Additional guarded writes
+  under consideration: AP reboot (needs its own confirmation/cooldown
+  policy - no meaningful before/after preview for a reboot, mirroring
+  mcp-mikrotik's own reasoning for excluding it from *its* v0 allowlist),
+  LED control.
 - **v3-controller compatibility.** The pre-v5 controller UI uses a
   different login call and session cookie name entirely - recorded as a
   historical note (not independently verified) in `docs/api-notes.md`, for
@@ -218,7 +270,8 @@ offering is the [Omada Open API](https://omada-northbound-docs.tplinkcloud.com/)
 - [gaspareduard/Omada-mcp](https://github.com/gaspareduard/Omada-mcp) — Open-API-based, capability-gated.
 
 How this project differs: **read-only by default with no generic endpoint
-escape hatch** (write tools will land behind an explicit allowlist, mirroring
+escape hatch** (every write lands behind an explicit, reviewable allowlist -
+`OMADA_ALLOW_WRITE` + `guard.py`, mirroring
 [mcp-mikrotik](https://github.com/thalisantunes/mcp-mikrotik)), and the
 **legacy `/api/v2` path** — which Open-API-only clients cannot reach (the
 Open API token is rejected there; verified against real hardware) — for the

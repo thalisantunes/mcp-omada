@@ -35,6 +35,20 @@ def settings_legacy(fake_controller: FakeOmadaController) -> Settings:
 
 
 @pytest.fixture
+def settings_legacy_write_enabled(fake_controller: FakeOmadaController) -> Settings:
+    return Settings(
+        base_url=BASE_URL,
+        auth_mode=AuthMode.LEGACY,
+        omadac_id=fake_controller.omadac_id,
+        site_id=None,
+        username=fake_controller.legacy_username,
+        password=fake_controller.legacy_password,
+        verify_tls=False,
+        allow_write=True,
+    )
+
+
+@pytest.fixture
 def settings_openapi(fake_controller: FakeOmadaController) -> Settings:
     return Settings(
         base_url=BASE_URL,
@@ -50,6 +64,11 @@ def settings_openapi(fake_controller: FakeOmadaController) -> Settings:
 @pytest.fixture
 def legacy_client(settings_legacy: Settings, transport: httpx.MockTransport) -> OmadaClient:
     return OmadaClient(settings_legacy, transport=transport)
+
+
+@pytest.fixture
+def legacy_client_write_enabled(settings_legacy_write_enabled: Settings, transport: httpx.MockTransport) -> OmadaClient:
+    return OmadaClient(settings_legacy_write_enabled, transport=transport)
 
 
 @pytest.fixture
