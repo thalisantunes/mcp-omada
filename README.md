@@ -1,5 +1,7 @@
 # mcp-omada
 
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache_2.0-blue)](LICENSE)
+
 A [Model Context Protocol](https://modelcontextprotocol.io) server for
 [TP-Link Omada](https://www.tp-link.com/en/omada-sdn/) SDN controllers -
 read controller/site/device/WiFi state and, for one guarded write, change
