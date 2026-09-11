@@ -1,0 +1,48 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.thalisantunes/mcp-omada",
+  "title": "TP-Link Omada MCP",
+  "description": "TP-Link Omada SDN controllers: read-only network state plus one guarded write.",
+  "version": "0.2.0",
+  "repository": {
+    "url": "https://github.com/thalisantunes/mcp-omada",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "mcp-omada",
+      "version": "0.2.0",
+      "runtimeHint": "uvx",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "OMADA_BASE_URL",
+          "description": "Controller base URL, e.g. https://192.168.1.2:8043",
+          "isRequired": true
+        },
+        {
+          "name": "OMADA_USER",
+          "description": "Controller username (legacy auth mode)"
+        },
+        {
+          "name": "OMADA_PASS",
+          "description": "Controller password (legacy auth mode)",
+          "isSecret": true
+        },
+        {
+          "name": "OMADA_CLIENT_ID",
+          "description": "OpenAPI client id (openapi auth mode)"
+        },
+        {
+          "name": "OMADA_CLIENT_SECRET",
+          "description": "OpenAPI client secret (openapi auth mode)",
+          "isSecret": true
+        }
+      ]
+    }
+  ]
+}
