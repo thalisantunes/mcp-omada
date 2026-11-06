@@ -3,6 +3,13 @@
 All notable changes to this project are documented here. Versions follow
 [Semantic Versioning](https://semver.org).
 
+## [Unreleased]
+
+### Changed
+- HTML error responses (e.g. Tomcat "HTTP Status 500" from port 8043 on OC200/OC300
+  6.x) now raise a `ControllerConnectionError` that points at the 443-vs-8043 port
+  (issue #2). README and `docs/api-notes.md` document the finding.
+
 ## [0.2.0] - 2026-07-13 - First guarded write + Insight clients/alerts
 
 Everything in this release was verified against a real TP-Link OC200,
