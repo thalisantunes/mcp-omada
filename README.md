@@ -50,7 +50,7 @@ mcp-mikrotik's `devices.yaml`).
 
    | Variable | Default | Meaning |
    |---|---|---|
-   | `OMADA_BASE_URL` | *(required)* | Controller base URL, e.g. `https://192.168.1.2:8043` |
+   | `OMADA_BASE_URL` | *(required)* | Controller base URL. Hardware controllers (OC200/OC300, firmware 6.x): `https://192.168.1.2` (port 443, **not** 8043 - see Troubleshooting). Omada Software Controller: `https://host:8043` |
    | `OMADA_OMADAC_ID` | *(auto)* | Controller ID; auto-discovered via `GET /api/info` if unset |
    | `OMADA_SITE_ID` | *(auto)* | Site to operate on; auto-selected if the controller manages exactly one site (**legacy auth only** - see below) |
    | `OMADA_USER` / `OMADA_PASS` | - | Legacy local-user login (**preferred** - richer field set). A **Viewer** role is enough for all read tools; **`set_radio_channel` (write) requires an Administrator-role user** - the controller's own RBAC returns `-1007 "user does not have permissions"` for a Viewer even when `OMADA_ALLOW_WRITE=true` (verified live: a defense-in-depth layer on top of this server's write guard). |
@@ -73,6 +73,16 @@ mcp-mikrotik's `devices.yaml`).
    port - strict verification would refuse to connect out of the box. Set
    it to `true` once the controller has a certificate you can actually
    validate.
+
+## Troubleshooting
+
+**`HTTP 500` HTML page ("HTTP Status 500 - Internal Server Error") on login.** On
+hardware controllers (OC200/OC300) running firmware 6.x, the API is served on the
+default HTTPS port **443**. Port 8043 is the backend Tomcat: `GET /api/info` works
+there, but every `POST` (legacy `/api/v2/login`, Open API token) returns an HTML 500
+(reproduced on an OC200 6.3.0.111; see `docs/api-notes.md`). Set
+`OMADA_BASE_URL=https://<controller-ip>` (no `:8043`). Port 8043 remains the
+right one for the Omada Software Controller.
 
 ## Running
 

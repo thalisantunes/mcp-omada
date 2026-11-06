@@ -91,6 +91,30 @@ The Open API app itself must be created in the controller UI first:
 | Set AP radio channel (`set_radio_channel`, v0.2 write) | Yes - `PATCH /{oid}/api/v2/sites/{sid}/eaps/{MAC}` | **Not verified.** `set_radio_channel` raises `FeatureUnavailableError` in Open API-only mode. |
 | Device/system logs (`get_logs`) | **Not found.** Every path tried (`log`, `logs`, `logs/queryLog` GET+POST, `setting/logs/logs`, `insight/logs`) returned `errorCode -1600` - see "Endpoints tried and NOT found" below. Not implemented in v0.2 - pending v0.3 (see README Roadmap). | Not attempted. |
 
+## Port 443 vs 8043 (hardware controllers, firmware 6.x)
+
+Observed 2026-11-05 on a real OC200, firmware 6.3.0.111, local Viewer user:
+
+| Request | `https://host` (443, nginx) | `https://host:8043` (Tomcat) |
+|---|---|---|
+| `GET /api/info` | 200 JSON | 200 JSON |
+| `GET /` | 200 (UI) | 302 to `https://host/` |
+| `POST /api/v2/login` and `POST /{oid}/api/v2/login` (valid JSON body) | 200, `errorCode 0`, token + `TPOMADA_SESSIONID` | **500, Tomcat HTML page** |
+| `POST /openapi/authorize/token` | 200 JSON (`-44106` for bad client) | **500 HTML** |
+| `GET /api/v2/loginStatus` | n/a | 500 HTML |
+
+On 443, login works with or without the `{oid}` path segment, with or without
+`Accept`, with `Content-Type` `application/json`, `application/json; charset=UTF-8`,
+`text/plain` or none; a form-encoded body gives `-1001`, a bad password `-30109`.
+Only a literal JSON `null` body produced a 500 (JSON error object, not HTML).
+`list_sites`/`list_devices` through this package work on 443.
+
+Conclusion: the HTML 500 is a port problem, not a body/header problem. Firmware
+6.3.0.45 was not available for testing; the issue's symptoms (HTML Tomcat 500 on
+both login paths, `/api/info` fine on 8043) match the 8043 behaviour above.
+Third-party corroboration: a TP-Link community report of the same 500 on OC300
+6.1.0.19 port 8043, answered with "use 443".
+
 ## Verified endpoints
 
 ### `GET /api/info` (no auth)

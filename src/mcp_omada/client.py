@@ -80,11 +80,35 @@ TOKEN_REFRESH_MARGIN_SECONDS = 60
 _AP_DEVICE_TYPES = ("ap", "eap")
 
 
+# Hint appended when the controller answers with an HTML error page instead of
+# the usual JSON envelope. Reproduced against a real OC200 (firmware 6.3.0.111,
+# 2026-11-05): on 6.x hardware controllers the API is served by an nginx on
+# 443, while 8043 is the backend Tomcat - GET /api/info works there, but every
+# POST (login, Open API token) returns a Tomcat "HTTP Status 500" HTML page.
+# See docs/api-notes.md ("Port 443 vs 8043").
+_HTML_ERROR_HINT = (
+    "The controller returned an HTML error page, not the JSON API envelope. If OMADA_BASE_URL "
+    "ends in :8043 and the controller is a hardware one (OC200/OC300, firmware 6.x), try the "
+    "default HTTPS port instead (e.g. https://<host>, port 443); 8043 is for the Omada "
+    "Software Controller."
+)
+
+
+def _looks_like_html(response: httpx.Response) -> bool:
+    content_type = response.headers.get("content-type", "").lower()
+    if "html" in content_type:
+        return True
+    return response.text.lstrip()[:15].lower().startswith(("<!doctype html", "<html"))
+
+
 def _parse_envelope(response: httpx.Response, path: str) -> dict[str, Any]:
     try:
         payload = response.json()
     except ValueError as exc:
-        raise ControllerConnectionError(f"non-JSON response from {path} (HTTP {response.status_code})") from exc
+        detail = f"non-JSON response from {path} (HTTP {response.status_code})"
+        if _looks_like_html(response):
+            detail += f". {_HTML_ERROR_HINT}"
+        raise ControllerConnectionError(detail) from exc
     if not isinstance(payload, dict):
         raise ControllerConnectionError(f"unexpected response shape from {path} (HTTP {response.status_code})")
     return payload

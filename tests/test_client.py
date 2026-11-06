@@ -320,6 +320,43 @@ def test_non_json_response_raises_controller_connection_error():
         client.get_controller_info()
 
 
+def test_html_error_page_gets_port_hint():
+    html = b"<!doctype html><html><head><title>HTTP Status 500</title></head></html>"
+
+    def _respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, content=html, headers={"content-type": "text/html;charset=utf-8"})
+
+    settings = Settings(
+        base_url="https://omada.example.test:8043", auth_mode=AuthMode.LEGACY, username="a", password="b"
+    )
+    client = OmadaClient(settings, transport=httpx.MockTransport(_respond))
+    with pytest.raises(ControllerConnectionError) as excinfo:
+        client.get_controller_info()
+    assert "HTTP 500" in str(excinfo.value)
+    assert "443" in str(excinfo.value)
+
+
+def test_html_body_without_content_type_gets_port_hint():
+    def _respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, content=b"  <HTML><body>boom</body></HTML>", headers={"content-type": "text/plain"})
+
+    settings = Settings(base_url="https://omada.example.test", auth_mode=AuthMode.LEGACY, username="a", password="b")
+    client = OmadaClient(settings, transport=httpx.MockTransport(_respond))
+    with pytest.raises(ControllerConnectionError, match="HTML error page"):
+        client.get_controller_info()
+
+
+def test_plain_non_json_has_no_html_hint():
+    def _respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(502, content=b"bad gateway", headers={"content-type": "text/plain"})
+
+    settings = Settings(base_url="https://omada.example.test", auth_mode=AuthMode.LEGACY, username="a", password="b")
+    client = OmadaClient(settings, transport=httpx.MockTransport(_respond))
+    with pytest.raises(ControllerConnectionError) as excinfo:
+        client.get_controller_info()
+    assert "HTML" not in str(excinfo.value)
+
+
 def test_unexpected_json_shape_raises_controller_connection_error():
     def _respond(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=b"[1, 2, 3]")
